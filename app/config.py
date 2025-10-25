@@ -1,6 +1,10 @@
 from __future__ import annotations
 import os
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# Load .env if present
+load_dotenv()
 
 class Settings(BaseModel):
     gcp_project: str = Field(default_factory=lambda: os.getenv("GCP_PROJECT", ""))
