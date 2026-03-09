@@ -15,12 +15,14 @@ Data: 5-minute NQ futures bars
 """
 
 import csv
+import os
 from collections import OrderedDict, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 # ── Load Data ──────────────────────────────────────────────────────────
 def load_data(path="nq_5min.csv"):
+    """Load from single CSV (old local format: time,open,high,low,close)."""
     data = OrderedDict()
     with open(path) as f:
         reader = csv.DictReader(f)
@@ -37,6 +39,83 @@ def load_data(path="nq_5min.csv"):
                 'low': float(row['low']),
                 'close': float(row['close']),
             })
+    return data
+
+
+def load_repo_data(base_dir):
+    """Load all *_5m.csv files from the repo (format: ts_event,open,high,low,close,...)."""
+    import glob
+    data = OrderedDict()
+    files = sorted(glob.glob(os.path.join(base_dir, "*/*/*_5m.csv")))
+    print(f"  Loading {len(files)} monthly files...")
+
+    for fpath in files:
+        with open(fpath) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts = row['ts_event']
+                # Format: 2010-06-06T22:00:00.000000000Z — parse as UTC
+                dt_str = ts[:19]  # trim nanoseconds and Z
+                dt = datetime.fromisoformat(dt_str)
+                # Convert UTC to US/Eastern (ET): UTC-4 during EDT, UTC-5 during EST
+                # Approximate: Mar-Nov = EDT (UTC-4), Nov-Mar = EST (UTC-5)
+                month = dt.month
+                if 3 <= month <= 10:
+                    offset_hours = 4  # EDT
+                elif month == 11:
+                    offset_hours = 5  # EST (approximate)
+                elif month == 2:
+                    offset_hours = 5  # EST
+                else:
+                    offset_hours = 5  # EST (Nov-Mar)
+                dt_et = dt - timedelta(hours=offset_hours)
+
+                date_str = dt_et.strftime('%Y-%m-%d')
+                time_str = dt_et.strftime('%H:%M')
+
+                # Only keep RTH window bars (9:25 to 10:05 to be safe)
+                if not ('09:25' <= time_str <= '10:05'):
+                    continue
+
+                o = float(row['open'])
+                h = float(row['high'])
+                l = float(row['low'])
+                c = float(row['close'])
+
+                # Data quality: repair corrupted OHLC values
+                # Common issues: truncated lows (230.75 when ~23075),
+                # negative values (-1.8 when ~1838)
+                ref = max(v for v in [o, h, l, c] if v > 0) if any(v > 0 for v in [o, h, l, c]) else 0
+                if ref <= 0:
+                    continue
+
+                # Repair each field if it's way off from the reference
+                threshold = ref * 0.5
+                if o <= 0 or o < threshold:
+                    o = c if c >= threshold else ref
+                if c <= 0 or c < threshold:
+                    c = o if o >= threshold else ref
+                if l <= 0 or l < threshold:
+                    l = min(o, c)  # conservative: use min of open/close
+                if h <= 0 or h < threshold:
+                    h = max(o, c)
+                if h < l:
+                    h, l = l, h
+
+                if date_str not in data:
+                    data[date_str] = []
+                data[date_str].append({
+                    'time': time_str,
+                    'open': o,
+                    'high': h,
+                    'low': l,
+                    'close': c,
+                })
+
+    # Sort bars within each day
+    for date_str in data:
+        data[date_str].sort(key=lambda b: b['time'])
+
     return data
 
 
@@ -128,10 +207,12 @@ def strat_a_first_candle_reversal(data):
         entry = wb[1]['open']  # 9:35 open
         exit_price = wb[-1]['close']  # 9:55 close
 
+        buf = candle_930['close'] * 0.0003  # ~0.03% buffer scales with price
+
         if is_bullish:
             # Short: fade the bull candle
             direction = 'S'
-            stop = candle_930['high'] + 5
+            stop = candle_930['high'] + buf
             risk = stop - entry
             # Check stop hit on bars 9:35–9:55
             stopped = False
@@ -143,7 +224,7 @@ def strat_a_first_candle_reversal(data):
         else:
             # Long: fade the bear candle
             direction = 'L'
-            stop = candle_930['low'] - 5
+            stop = candle_930['low'] - buf
             risk = entry - stop
             stopped = False
             for bar in wb[1:]:
@@ -174,7 +255,7 @@ def strat_b_first_candle_breakout(data):
         high_level = c930['high']
         low_level = c930['low']
         rng = high_level - low_level
-        if rng <= 2:
+        if rng <= c930['close'] * 0.0005:  # skip tiny ranges (<0.05%)
             continue
 
         exit_price = wb[-1]['close']
@@ -282,7 +363,7 @@ def strat_c_three_bar_momentum(data):
 #         fade the move at 9:45 open. Exit at 9:55 close.
 #         Stop: extreme of move + buffer.
 # ══════════════════════════════════════════════════════════════════════
-def strat_d_mean_reversion(data, threshold=50):
+def strat_d_mean_reversion(data, threshold_pct=0.25):
     trades = []
     for date, bars in data.items():
         wb = get_window_bars(bars)
@@ -293,6 +374,7 @@ def strat_d_mean_reversion(data, threshold=50):
         # Measure move after 2 bars (9:30, 9:35 → check at 9:40 open = 9:35 close)
         close_2bars = wb[1]['close']  # 9:35 close
         move = close_2bars - open_price
+        threshold = open_price * threshold_pct / 100  # percentage-based
 
         if abs(move) < threshold:
             continue
@@ -304,7 +386,7 @@ def strat_d_mean_reversion(data, threshold=50):
             # Big move up → fade short
             direction = 'S'
             extreme = max(wb[0]['high'], wb[1]['high'])
-            stop = extreme + 10
+            stop = extreme + open_price * 0.0005
             risk = stop - entry
             stopped = False
             for bar in wb[2:]:
@@ -316,7 +398,7 @@ def strat_d_mean_reversion(data, threshold=50):
             # Big move down → fade long
             direction = 'L'
             extreme = min(wb[0]['low'], wb[1]['low'])
-            stop = extreme - 10
+            stop = extreme - open_price * 0.0005
             risk = entry - stop
             stopped = False
             for bar in wb[2:]:
@@ -358,14 +440,14 @@ def strat_e_bias_pullback(data):
                 if bias_up and bar['close'] < bar['open']:
                     # Pullback candle in uptrend → buy at close
                     entry = bar['close']
-                    stop = bar['low'] - 5
+                    stop = bar['low'] - bar['close'] * 0.0003
                     risk = entry - stop
                     direction = 'L'
                     entered = True
                 elif bias_down and bar['close'] > bar['open']:
                     # Pullback candle in downtrend → sell at close
                     entry = bar['close']
-                    stop = bar['high'] + 5
+                    stop = bar['high'] + bar['close'] * 0.0003
                     risk = stop - entry
                     direction = 'S'
                     entered = True
@@ -405,7 +487,7 @@ def strat_f_two_bar_orb(data):
         or_high = max(wb[0]['high'], wb[1]['high'])
         or_low = min(wb[0]['low'], wb[1]['low'])
         rng = or_high - or_low
-        if rng <= 5:
+        if rng <= wb[0]['close'] * 0.001:  # skip tiny ranges (<0.1%)
             continue
 
         exit_price = wb[-1]['close']
@@ -450,11 +532,18 @@ def strat_f_two_bar_orb(data):
 if __name__ == "__main__":
     import os
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data = load_data(os.path.join(script_dir, "nq_5min.csv"))
+
+    # Load from repo's monthly 5m files (15 years of data)
+    data = load_repo_data(script_dir)
     dates = sorted(data.keys())
+
+    # Filter to days that have a proper 9:30-9:55 window (6 bars)
+    valid_days = {d: bars for d, bars in data.items() if len(get_window_bars(bars)) >= 6}
+    data = OrderedDict(sorted(valid_days.items()))
 
     print("#" * 70)
     print("#    NQ 9:30–10:00 WINDOW-ONLY STRATEGIES")
+    dates = sorted(data.keys())
     print(f"#    Data: {dates[0]} to {dates[-1]}  ({len(dates)} days)")
     print(f"#    All trades enter & exit within 9:30–10:00")
     print("#" * 70)
@@ -476,10 +565,10 @@ if __name__ == "__main__":
         "STRATEGY C: 3-Bar Momentum",
         "If 9:30–9:44 all green/red → enter at 9:45 in that direction.", tc)
 
-    td = strat_d_mean_reversion(data, threshold=50)
+    td = strat_d_mean_reversion(data, threshold_pct=0.25)
     results['D'] = print_results(
         "STRATEGY D: Mean Reversion (Fade Big Move)",
-        "If >50pt move in first 10min → fade at 9:40. Exit 9:55 close.", td)
+        "If >0.25% move in first 10min → fade at 9:40. Exit 9:55 close.", td)
 
     te = strat_e_bias_pullback(data)
     results['E'] = print_results(
@@ -522,23 +611,27 @@ if __name__ == "__main__":
     best_trades = all_trades[best_key]
 
     print(f"\n\n{'='*70}")
-    print(f"  MONTHLY BREAKDOWN — {best_label}")
+    print(f"  YEARLY BREAKDOWN — {best_label}")
     print(f"{'='*70}")
 
-    monthly = defaultdict(list)
+    yearly = defaultdict(list)
     for t in best_trades:
-        month = t['date'][:7]
-        monthly[month].append(t['pnl'])
+        year = t['date'][:4]
+        yearly[year].append(t['pnl'])
 
-    print(f"\n  {'Month':<10} {'Trades':>6} {'Win%':>7} {'Total':>10} {'Cumulative':>12}")
-    print(f"  {'-'*45}")
+    print(f"\n  {'Year':<6} {'Trades':>6} {'Win%':>7} {'PF':>7} {'Total Pts':>10} {'Cumulative':>12}")
+    print(f"  {'-'*54}")
     cum = 0
-    for month in sorted(monthly.keys()):
-        pnls = monthly[month]
+    for year in sorted(yearly.keys()):
+        pnls = yearly[year]
         w = len([p for p in pnls if p > 0])
+        l_pnls = [p for p in pnls if p < 0]
         total = sum(pnls)
         cum += total
         wr = w / len(pnls) * 100
-        print(f"  {month:<10} {len(pnls):>6} {wr:>6.1f}% {total:>+10.1f} {cum:>+12.1f}")
+        gp = sum(p for p in pnls if p > 0)
+        gl = abs(sum(p for p in pnls if p < 0))
+        pf = gp / gl if gl > 0 else float('inf')
+        print(f"  {year:<6} {len(pnls):>6} {wr:>6.1f}% {pf:>7.2f} {total:>+10.1f} {cum:>+12.1f}")
 
     print()
